@@ -36,7 +36,7 @@ models:
           DATEDIFF('hour', arrival_ts, departure_ts). Records with dwell_hours <= 0 are filtered.
         tests:
           - not_null
-          - expression_is_true:
+          - dbt_utils.expression_is_true:
               arguments:
                 expression: "> 0"
       - name: anchorage_wait_h

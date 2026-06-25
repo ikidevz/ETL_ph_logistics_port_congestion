@@ -181,7 +181,7 @@ with DAG(
     def dbt_test():
         """
         Run all dbt schema tests (not_null, unique, accepted_values,
-        expression_is_true) + singular test assert_positive_dwell.
+        dbt_utils.expression_is_true) + singular test assert_positive_dwell.
         Fails the DAG on any data quality violation.
         """
         _dbt("test")

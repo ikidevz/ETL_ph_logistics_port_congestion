@@ -44,7 +44,7 @@ models:
           Filtered to <= 200 km; must be > 0 (self-joins excluded by p2.port_code != p.port_code).
         tests:
           - not_null
-          - expression_is_true:
+          - dbt_utils.expression_is_true:
               arguments:
                 expression: "> 0 AND distance_km <= 200"
       - name: nearest_alt_port

@@ -104,7 +104,7 @@ Dynamic Tables eliminate stream processing infrastructure (no Kafka brokers, con
 
 ### Why no dbt packages?
 
-This project uses only Snowflake-native functions: `ST_DISTANCE`, `ST_MAKEPOINT`, `H3_LATLNG_TO_CELL_STRING`, `GENERATOR`. No `dbt_utils` or `dbt_expectations` are required. **`dbt deps` is not needed.** The custom `expression_is_true` tests in `schema.yml` use Snowflake SQL directly.
+This project uses only Snowflake-native functions: `ST_DISTANCE`, `ST_MAKEPOINT`, `H3_LATLNG_TO_CELL_STRING`, `GENERATOR`. No `dbt_utils` or `dbt_expectations` are required. **`dbt deps` is not needed.** The custom `dbt_utils.expression_is_true` tests in `schema.yml` use Snowflake SQL directly.
 
 ### Idempotency by design
 
@@ -735,15 +735,15 @@ dbt run --select marts.analytics \
 
 ### Schema tests (in `schema.yml` files)
 
-Every key column has at least `not_null`. Natural keys (`shipment_id`, `entry_number`, `vessel_imo`, etc.) have `not_null + unique`. Enum columns use `accepted_values`. Numeric measures use `expression_is_true` with range guards.
+Every key column has at least `not_null`. Natural keys (`shipment_id`, `entry_number`, `vessel_imo`, etc.) have `not_null + unique`. Enum columns use `accepted_values`. Numeric measures use `dbt_utils.expression_is_true` with range guards.
 
 Examples:
 
 - `delay_category` → `accepted_values: ['ON_TIME', 'MINOR_DELAY', 'MODERATE_DELAY', 'SEVERE_DELAY']`
 - `tariff_rate_pct` → `accepted_values: [0, 3, 5, 7, 10, 15]`
-- `dwell_hours` → `expression_is_true: ">= 1"`
-- `distance_km` → `expression_is_true: "> 0 AND distance_km <= 200"`
-- `total_landed_cost_php` → `expression_is_true: "> 0"`
+- `dwell_hours` → `dbt_utils.expression_is_true: ">= 1"`
+- `distance_km` → `dbt_utils.expression_is_true: "> 0 AND distance_km <= 200"`
+- `total_landed_cost_php` → `dbt_utils.expression_is_true: "> 0"`
 
 ### Singular test (tests/assert_positive_dwell.sql)
 

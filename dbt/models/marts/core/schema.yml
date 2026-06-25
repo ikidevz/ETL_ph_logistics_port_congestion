@@ -268,7 +268,7 @@ models:
         description: "Total port dwell in hours (arrival to departure)."
         tests:
           - not_null
-          - expression_is_true:
+          - dbt_utils.expression_is_true:
               arguments:
                 expression: ">= 0"
       - name: anchorage_wait_h
