@@ -1,0 +1,216 @@
+version: 2
+
+models:
+  - name: stg_vessel_calls
+    description: >
+      Cleaned and typed vessel port call events from bronze.raw_vessel_calls.
+      Filters out null arrival timestamps and zero/negative dwell records.
+      Uppercases port_code and cargo_type for consistent joining to dim_port and dim_vessel.
+      H3 geospatial enrichment is intentionally deferred to fct_port_dwell where
+      dim_port (which holds h3_res5 / h3_res7) is already joined — staging must not
+      reference gold dimension models.
+    config:
+      materialized: view
+      schema: silver
+    columns:
+      - name: vessel_imo
+        description: "IMO vessel identifier — uppercased and null-filtered. Joins to dim_vessel."
+        tests:
+          - not_null
+      - name: port_code
+        description: "Uppercased and trimmed PH port code (MICT, BCT, CEBU, DAVAO, SUBIC). Joins to dim_port."
+        tests:
+          - not_null
+      - name: arrival_ts
+        description: "Vessel arrival timestamp (TIMESTAMP_NTZ). NULL records excluded by WHERE clause."
+        tests:
+          - not_null
+      - name: berth_ts
+        description: "Actual berth assignment timestamp. May be null for vessels that berthed immediately."
+      - name: departure_ts
+        description: "Vessel departure timestamp. Used as fallback to compute dwell_hours when the raw column is null."
+      - name: dwell_hours
+        description: >
+          Total port dwell in hours (arrival to departure).
+          Coalesced: uses raw dwell_hours if present, otherwise computed as
+          DATEDIFF('hour', arrival_ts, departure_ts). Records with dwell_hours <= 0 are filtered.
+        tests:
+          - not_null
+          - expression_is_true:
+              arguments:
+                expression: "> 0"
+      - name: anchorage_wait_h
+        description: "Hours waiting at anchorage before berth. Zero for vessels that berthed immediately. Congestion proxy: > 24 h flags is_congested in fct_port_dwell."
+        tests:
+          - not_null
+      - name: cargo_type
+        description: "Uppercased cargo classification: FCL | LCL | RORO | BULK."
+      - name: teu_count
+        description: "TEU volume for this port call. Integer 10–2000."
+      - name: _loaded_at
+        description: "Bronze load timestamp passed through for incremental watermarking in fct_port_dwell."
+
+  - name: stg_shipments
+    description: >
+      Cleaned shipment lifecycle records from bronze.raw_shipments.
+      Key transformations: origin_port and dest_port uppercased for join safety;
+      delay_hours recomputed using GREATEST(0, DATEDIFF('hour', eta, ata)) to clamp
+      early arrivals to zero (prevents negative delay values from biasing averages);
+      delay_category derived from the recomputed delay_hours into four ordinal bands.
+      Records with null shipment_id are excluded.
+    config:
+      materialized: view
+      schema: silver
+    columns:
+      - name: shipment_id
+        description: "UUID primary key — not null and unique. FK target for stg_customs_entries and all downstream fact/dim models."
+        tests:
+          - not_null
+          - unique
+      - name: bl_number
+        description: "Bill of Lading number."
+      - name: origin_port_code
+        description: "Uppercased LOCODE of origin port (CNSHA, SGSIN, JPOSA, USLAX, NLRTM)."
+      - name: dest_port_code
+        description: "Uppercased PH destination port code. Joins to dim_port."
+      - name: carrier_code
+        description: "Uppercased carrier code (MAERSK, MSC, EVERGREEN, CMA, OOCL). Joins to dim_carrier."
+      - name: vessel_imo
+        description: "IMO of carrying vessel. Joins to dim_vessel."
+      - name: etd
+        description: "Estimated Time of Departure (TIMESTAMP_NTZ)."
+      - name: eta
+        description: "Estimated Time of Arrival (TIMESTAMP_NTZ). Basis for delay calculation."
+      - name: ata
+        description: "Actual Time of Arrival (TIMESTAMP_NTZ). Null if shipment is still in transit."
+      - name: delay_hours
+        description: >
+          Recomputed delay in hours: GREATEST(0, DATEDIFF('hour', eta, ata)).
+          Clamped to 0 for early arrivals to prevent negative values.
+          Null when ata is null (in-transit shipments treated as 0-delay).
+        tests:
+          - not_null
+      - name: delay_category
+        description: >
+          Ordinal delay band derived from delay_hours:
+          ON_TIME (0 h), MINOR_DELAY (1–24 h), MODERATE_DELAY (25–72 h), SEVERE_DELAY (> 72 h).
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                ["ON_TIME", "MINOR_DELAY", "MODERATE_DELAY", "SEVERE_DELAY"]
+      - name: declared_value_usd
+        description: "CIF declared value in USD. Passed through from bronze for fct_landed_cost."
+      - name: freight_usd
+        description: "Freight component in USD."
+      - name: insurance_usd
+        description: "Insurance component in USD."
+      - name: commodity_code
+        description: "HS commodity code. Joins to ph_tariff_rates seed in fct_landed_cost."
+      - name: cargo_type
+        description: "Cargo category (Electronics, Machinery, Textiles, Food, Chemicals). Used to infer incoterm in dim_shipment."
+      - name: _loaded_at
+        description: "Bronze load timestamp. Incremental watermark for fct_shipment_events and fct_landed_cost."
+
+  - name: stg_customs_entries
+    description: >
+      Cleaned Philippine BOC customs entries from bronze.raw_customs_entries.
+      Key transformations: entry_type, payment_mode, commodity_code, and port_code all
+      uppercased and trimmed for consistent lookups; processing_days coalesced from
+      the raw column or recomputed via DATEDIFF('day', lodge_date, release_date) when null.
+      Records missing entry_number or shipment_id are excluded.
+    config:
+      materialized: view
+      schema: silver
+    columns:
+      - name: entry_number
+        description: "Customs entry number — unique per BOC entry. Not null."
+        tests:
+          - not_null
+          - unique
+      - name: shipment_id
+        description: "FK to stg_shipments.shipment_id. One-to-one relationship."
+        tests:
+          - not_null
+      - name: bl_number
+        description: "Bill of Lading — denormalized from shipment for customs context."
+      - name: commodity_code
+        description: "Uppercased HS code. Carried into dim_customs_entry for commodity-level reporting."
+      - name: entry_type
+        description: "Uppercased BOC entry classification."
+        tests:
+          - accepted_values:
+              values:
+                [
+                  "FORMAL",
+                  "INFORMAL",
+                  "WAREHOUSING",
+                  "CONSUMPTION",
+                  "TRANSIT",
+                  "TRANSSHIPMENT",
+                  "TEMPORARY_IMPORTATION",
+                  "TEMPORARY_EXPORTATION",
+                  "EXPORT_DECLARATION",
+                  "REEXPORTATION",
+                  "REIMPORTATION",
+                  "DUTY_DRAWBACK",
+                  "FREEPORT_ENTRY",
+                  "FREEZONE_ENTRY",
+                  "COURIER_ENTRY",
+                  "POSTAL_ENTRY",
+                  "PROJECT_CARGO_ENTRY",
+                  "GOVERNMENT_IMPORTATION",
+                  "DIPLOMATIC_ENTRY",
+                  "RELIEF_GOODS_ENTRY",
+                  "BONDED_TRANSFER",
+                  "SPECIAL_PERMIT_ENTRY",
+                ]
+      - name: declared_value_usd
+        description: "CIF value (item + freight + insurance). Duty base per Philippine customs law."
+      - name: tariff_rate_pct
+        description: "Applied duty rate percentage."
+      - name: duties_usd
+        description: "Computed duties in USD."
+      - name: vat_usd
+        description: "12% VAT on CIF + duties."
+      - name: total_tax_usd
+        description: "duties_usd + vat_usd."
+      - name: lodge_date
+        description: "Date entry was lodged with BOC."
+      - name: assessment_date
+        description: "Date BOC completed assessment."
+      - name: release_date
+        description: "Date cargo was released."
+      - name: processing_days
+        description: >
+          Days from lodge_date to release_date — clearance cycle KPI.
+          Coalesced: uses raw value if present, otherwise DATEDIFF('day', lodge_date, release_date).
+        tests:
+          - not_null
+      - name: payment_mode
+        description: "Uppercased duty payment method."
+        tests:
+          - accepted_values:
+              values:
+                [
+                  "CASH",
+                  "SURETY_BOND",
+                  "DEFERRED",
+                  "BANK_TRANSFER",
+                  "MANAGER_CHECK",
+                  "LETTER_OF_CREDIT",
+                  "TELEGRAPHIC_TRANSFER",
+                  "DOCUMENTARY_COLLECTION",
+                  "E_PAYMENT",
+                  "ONLINE_BANKING",
+                  "CUSTOMS_ACCOUNT",
+                  "ADVANCE_DEPOSIT",
+                  "ESCROW_ACCOUNT",
+                  "CORPORATE_CREDIT",
+                  "GUARANTEE_BOND",
+                  "TRUST_RECEIPT",
+                ]
+      - name: port_code
+        description: "Uppercased port code where customs clearance occurred."
+      - name: _loaded_at
+        description: "Bronze load timestamp passed through from source."

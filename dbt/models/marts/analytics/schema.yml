@@ -1,0 +1,443 @@
+version: 2
+
+models:
+  # ---------------------------------------------------------------------------
+  # Existing model — unchanged
+  # ---------------------------------------------------------------------------
+
+  - name: port_catchment_area
+    description: >
+      Grain: one row per (delayed shipment × alternative port within 200 km).
+      Geospatial analysis identifying the nearest alternative Philippine port for each
+      delayed shipment experiencing MODERATE_DELAY or SEVERE_DELAY. Uses Snowflake native
+      ST_DISTANCE(ST_MAKEPOINT(lon, lat), ST_MAKEPOINT(lon2, lat2)) to compute great-circle
+      distances in meters, converted to km. Restricted to alternative ports within 200 km
+      of the original destination — the operationally realistic rerouting radius for
+      Philippine port diversions.
+      Intended use: rerouting decision support during port congestion events;
+      powers the 'nearest alternative port' layer on the congestion map dashboard.
+      Depends on: fct_shipment_events (delayed shipments), dim_port (lat/lon for both
+      destination and candidate alternative ports).
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: shipment_id
+        description: >
+          FK to fct_shipment_events.shipment_id — the delayed shipment being analyzed
+          for rerouting. Not unique at this grain because one shipment may have multiple
+          alternative ports within 200 km.
+        tests:
+          - not_null
+      - name: dest_port_code
+        description: >
+          Original destination port code for the delayed shipment.
+          The port from which distance to alternatives is measured.
+        tests:
+          - not_null
+      - name: port_name
+        description: "Full name of the congested/delayed original destination port (from dim_port)."
+      - name: distance_km
+        description: >
+          Great-circle distance in kilometers between the original destination port
+          and the candidate alternative port. Computed as ST_DISTANCE / 1000.
+          Filtered to <= 200 km; must be > 0 (self-joins excluded by p2.port_code != p.port_code).
+        tests:
+          - not_null
+          - expression_is_true:
+              arguments:
+                expression: "> 0 AND distance_km <= 200"
+      - name: nearest_alt_port
+        description: >
+          Full name of the candidate alternative Philippine port within 200 km (from dim_port p2).
+          Results ordered by distance_km ascending so nearest option appears first per shipment.
+        tests:
+          - not_null
+
+  # ---------------------------------------------------------------------------
+  # New models
+  # ---------------------------------------------------------------------------
+
+  - name: carrier_performance
+    description: >
+      Grain: one row per carrier × origin_port_code × dest_port_code.
+      Pre-aggregated carrier delay performance by lane. Computes on-time rate,
+      delay distribution across the four delay bands, average/p50/p90 delay hours,
+      and a value-weighted delay metric (heavier shipments count more toward the average).
+      Feeds the 'delay trend by carrier' dashboard chart without pushing multi-join
+      aggregation to Metabase at query time.
+      Depends on: fct_shipment_events, dim_carrier, dim_port (x2 for origin + dest).
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: carrier_code
+        description: "Carrier SCAC / common name. Part of the composite grain."
+        tests:
+          - not_null
+      - name: carrier_name
+        description: "Full carrier name from dim_carrier (e.g. Maersk Line)."
+      - name: alliance
+        description: "Carrier alliance: 2M | OCEAN | INDEPENDENT."
+      - name: origin_port_code
+        description: "LOCODE of origin port. Part of the composite grain."
+        tests:
+          - not_null
+      - name: dest_port_code
+        description: "PH destination port code. Part of the composite grain."
+        tests:
+          - not_null
+      - name: origin_port_name
+        description: "Full origin port name from dim_port. Null for non-PH origin ports not in the seed."
+      - name: dest_port_name
+        description: "Full PH destination port name from dim_port."
+      - name: total_shipments
+        description: "Count of shipments on this carrier × lane combination."
+        tests:
+          - not_null
+      - name: on_time_pct
+        description: "Percentage of shipments arriving with delay_hours = 0. Primary carrier KPI."
+        tests:
+          - not_null
+      - name: minor_delay_count
+        description: "Shipments with delay_category = MINOR_DELAY (1–24 h)."
+      - name: moderate_delay_count
+        description: "Shipments with delay_category = MODERATE_DELAY (25–72 h)."
+      - name: severe_delay_count
+        description: "Shipments with delay_category = SEVERE_DELAY (> 72 h)."
+      - name: avg_delay_hours
+        description: "Mean delay hours across all shipments including on-time (0 h)."
+      - name: avg_delay_hours_when_late
+        description: "Mean delay hours for late shipments only (delay_hours > 0). Excludes on-time."
+      - name: max_delay_hours
+        description: "Worst single shipment delay on this lane."
+      - name: p50_delay_hours
+        description: "Median delay hours. Less sensitive to outliers than the mean."
+      - name: p90_delay_hours
+        description: "90th percentile delay hours — worst-case typical experience on this lane."
+      - name: value_weighted_delay_hours
+        description: >
+          Delay hours weighted by declared_value_usd. Higher-value shipments contribute more.
+          Useful when prioritising carrier negotiations by revenue impact.
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run."
+
+  - name: port_throughput_daily
+    description: >
+      Grain: one row per port_code × arrival_date_key.
+      Daily rollup of vessel call activity, TEU throughput, dwell time distribution,
+      and congestion rate per Philippine port. Fills the gap that dt_port_congestion
+      (a point-in-time Dynamic Table) cannot: historical trend data for week-over-week
+      and month-over-month dwell and congestion analysis.
+      Includes a 7-day rolling average dwell computed via a window function on the
+      daily grain — smooth enough for trend charts without a separate mart.
+      Incremental on arrival_date_key watermark.
+      Feeds the 'average dwell time by port' time-series dashboard chart.
+      Depends on: fct_port_dwell, dim_port, dim_date.
+    config:
+      materialized: incremental
+      schema: gold
+    columns:
+      - name: port_code
+        description: "PH port code. Part of the composite grain."
+        tests:
+          - not_null
+      - name: port_name
+        description: "Full port name from dim_port."
+      - name: region
+        description: "Philippine administrative region."
+      - name: port_type
+        description: "international | domestic."
+      - name: report_date
+        description: "The arrival_date_key this row summarises. Part of the composite grain."
+        tests:
+          - not_null
+      - name: year_num
+        description: "Calendar year from dim_date."
+      - name: month_num
+        description: "Month number 1–12 from dim_date."
+      - name: week_num
+        description: "ISO week number from dim_date."
+      - name: year_month
+        description: "YYYY-MM rollup string from dim_date. Used for monthly grouping in charts."
+      - name: vessel_calls
+        description: "Count of vessel port calls with arrival on this date."
+        tests:
+          - not_null
+      - name: total_teu
+        description: "Sum of TEU handled across all vessel calls on this date."
+      - name: avg_teu_per_call
+        description: "Average TEU per vessel call — proxy for vessel size mix."
+      - name: avg_dwell_hours
+        description: "Mean dwell hours across all vessel calls on this date."
+        tests:
+          - not_null
+      - name: min_dwell_hours
+        description: "Shortest dwell for any vessel call on this date."
+      - name: max_dwell_hours
+        description: "Longest dwell for any vessel call — potential outlier indicator."
+      - name: p50_dwell_hours
+        description: "Median dwell hours. Preferred over mean for skewed distributions."
+      - name: p90_dwell_hours
+        description: "90th percentile dwell — captures the long-tail congestion experience."
+      - name: avg_anchorage_wait_hours
+        description: "Mean anchorage wait before berth on this date."
+      - name: congested_vessel_calls
+        description: "Count of calls with anchorage_wait_h > 24 (is_congested = TRUE)."
+      - name: congestion_rate_pct
+        description: "Percentage of vessel calls that were congested on this date."
+      - name: rolling_7d_avg_dwell_hours
+        description: >
+          7-day rolling average dwell hours per port, computed via a window function.
+          Smooths daily volatility for trend line charts. Null for the first 6 days of
+          data per port (insufficient history for the window).
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run."
+
+  - name: customs_clearance_kpi
+    description: >
+      Grain: one row per port_code × entry_type × payment_mode.
+      Aggregates Philippine BOC customs clearance performance across the three classification
+      axes that most influence processing time: port, entry type (FORMAL/INFORMAL/WAREHOUSING),
+      and payment mode (CASH/SURETY_BOND/DEFERRED).
+      Computes average/p50/p90 processing days, SLA breach rate (> 5 days), clearance speed
+      band breakdown, and total tax collected.
+      This is the only analytics model with a primary source in the customs dimension —
+      the original analytics layer had no coverage of customs processing data at all.
+      Depends on: dim_customs_entry, dim_port.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: port_code
+        description: "Port where customs clearance occurred. Part of the composite grain."
+        tests:
+          - not_null
+      - name: port_name
+        description: "Full port name from dim_port."
+      - name: entry_type
+        description: "BOC entry classification: FORMAL | INFORMAL | WAREHOUSING. Part of the composite grain."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                [
+                  "FORMAL",
+                  "INFORMAL",
+                  "WAREHOUSING",
+                  "CONSUMPTION",
+                  "TRANSIT",
+                  "TRANSSHIPMENT",
+                  "TEMPORARY_IMPORTATION",
+                  "TEMPORARY_EXPORTATION",
+                  "EXPORT_DECLARATION",
+                  "REEXPORTATION",
+                  "REIMPORTATION",
+                  "DUTY_DRAWBACK",
+                  "FREEPORT_ENTRY",
+                  "FREEZONE_ENTRY",
+                  "COURIER_ENTRY",
+                  "POSTAL_ENTRY",
+                  "PROJECT_CARGO_ENTRY",
+                  "GOVERNMENT_IMPORTATION",
+                  "DIPLOMATIC_ENTRY",
+                  "RELIEF_GOODS_ENTRY",
+                  "BONDED_TRANSFER",
+                  "SPECIAL_PERMIT_ENTRY",
+                ]
+      - name: payment_mode
+        description: "Duty payment method. Part of the composite grain."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - CASH
+                - SURETY_BOND
+                - DEFERRED
+                - BANK_TRANSFER
+                - MANAGER_CHECK
+                - LETTER_OF_CREDIT
+                - TELEGRAPHIC_TRANSFER
+                - DOCUMENTARY_COLLECTION
+                - E_PAYMENT
+                - ONLINE_BANKING
+                - CUSTOMS_ACCOUNT
+                - ADVANCE_DEPOSIT
+                - ESCROW_ACCOUNT
+                - CORPORATE_CREDIT
+                - GUARANTEE_BOND
+                - TRUST_RECEIPT
+      - name: total_entries
+        description: "Count of customs entries in this segment."
+        tests:
+          - not_null
+      - name: avg_processing_days
+        description: "Mean days from lodge to release. Primary clearance KPI."
+        tests:
+          - not_null
+      - name: min_processing_days
+        description: "Fastest clearance in this segment."
+      - name: max_processing_days
+        description: "Slowest clearance — potential outlier or dispute case."
+      - name: p50_processing_days
+        description: "Median processing days."
+      - name: p90_processing_days
+        description: "90th percentile processing days — worst typical experience."
+      - name: sla_breach_count
+        description: "Entries taking more than 5 days to release (BOC target)."
+      - name: sla_breach_pct
+        description: "Percentage of entries breaching the 5-day SLA."
+      - name: fast_count
+        description: "Entries released within 2 days."
+      - name: standard_count
+        description: "Entries released in 3–5 days."
+      - name: slow_count
+        description: "Entries taking 6–10 days."
+      - name: critical_count
+        description: "Entries taking more than 10 days — escalation candidates."
+      - name: avg_tariff_rate_pct
+        description: "Average duty rate applied in this segment."
+      - name: avg_total_tax_usd
+        description: "Average combined duties + VAT per entry."
+      - name: total_tax_collected_usd
+        description: "Sum of all tax collected in this segment. Revenue metric for BOC."
+      - name: avg_declared_value_usd
+        description: "Average CIF value per entry in this segment."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run."
+
+  - name: commodity_cost_summary
+    description: >
+      Grain: one row per commodity_code × dest_port_code.
+      Aggregates fct_landed_cost by HS commodity code and destination port, computing
+      average and total landed cost in PHP alongside the USD cost component breakdown
+      (CIF, duties, VAT). Joins to ph_tariff_rates seed to surface the ATIGA preferential
+      rate alongside the applied rate — useful for identifying commodities where importers
+      could claim preferential treatment but are not.
+      Also computes avg_tax_burden_pct: the share of total landed cost consumed by duties
+      and VAT, which is the key metric for landed cost competitiveness analysis.
+      Pre-aggregates what the 'landed cost by commodity' dashboard chart needs — no
+      multi-join aggregation at query time in Metabase.
+      Depends on: fct_landed_cost, dim_shipment, ph_tariff_rates (seed), dim_port.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: commodity_code
+        description: "HS commodity code. Part of the composite grain."
+        tests:
+          - not_null
+      - name: commodity_desc
+        description: "Human-readable commodity description from ph_tariff_rates seed. Null if code has no seed match."
+      - name: cargo_type
+        description: "Cargo category from dim_shipment (Electronics, Machinery, Textiles, Food, Chemicals)."
+      - name: dest_port_code
+        description: "PH destination port code. Part of the composite grain."
+        tests:
+          - not_null
+      - name: dest_port_name
+        description: "Full destination port name from dim_port."
+      - name: shipment_count
+        description: "Number of shipments for this commodity at this port."
+        tests:
+          - not_null
+      - name: avg_cif_usd
+        description: "Average CIF value (item + freight + insurance) in USD."
+      - name: avg_duties_usd
+        description: "Average duties in USD."
+      - name: avg_vat_usd
+        description: "Average 12% VAT in USD."
+      - name: avg_total_tax_inclusive_usd
+        description: "Average of CIF + duties + VAT in USD — total cost before FX conversion."
+      - name: avg_landed_cost_php
+        description: "Average total landed cost in Philippine Peso. Primary dashboard KPI."
+        tests:
+          - not_null
+      - name: total_landed_cost_php
+        description: "Sum of all landed costs in PHP for this commodity × port segment."
+        tests:
+          - not_null
+      - name: min_landed_cost_php
+        description: "Lowest single-shipment landed cost in PHP."
+      - name: max_landed_cost_php
+        description: "Highest single-shipment landed cost in PHP."
+      - name: p50_landed_cost_php
+        description: "Median landed cost in PHP."
+      - name: avg_duty_rate_pct
+        description: "Average applied duty rate for this commodity × port."
+      - name: atiga_preferential_rate_pct
+        description: >
+          ASEAN ATIGA preferential duty rate from ph_tariff_rates seed.
+          Where atiga_preferential_rate_pct < avg_duty_rate_pct, importers may be
+          eligible for a lower rate under the ASEAN Free Trade Agreement.
+      - name: avg_tax_burden_pct
+        description: >
+          Average share of total landed cost consumed by duties + VAT (as a percentage).
+          High values flag commodities with significant tax exposure relative to goods value.
+      - name: avg_usd_php_rate
+        description: "Average USD/PHP rate applied across shipments in this segment. FX context for PHP figures."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run."
+
+  - name: congestion_delay_impact
+    description: >
+      Grain: one row per port_code × week_start_date.
+      Joins port-side congestion signals (from fct_port_dwell) to shipment-side delay
+      signals (from fct_shipment_events) on the same port × week, enabling correlation
+      analysis between anchorage congestion and downstream shipment delays.
+      This model validates the core thesis of the project: that port congestion
+      (measured by anchorage_wait_h and congestion_rate_pct) drives shipment delay_hours.
+      delay_to_wait_ratio is a simple correlation proxy — values consistently above 1.0
+      suggest delays exceed what anchorage wait alone explains (e.g. customs backlogs,
+      carrier scheduling issues); values below 1.0 suggest congestion is the dominant cause.
+      Congestion level labels use the same thresholds as dt_port_congestion (CRITICAL ≥ 60%,
+      HIGH ≥ 35%, MODERATE ≥ 15%, NORMAL otherwise) for consistency across the dashboard.
+      Incremental on week_start_date.
+      Depends on: fct_port_dwell, fct_shipment_events, dim_port.
+    config:
+      materialized: incremental
+      schema: gold
+    columns:
+      - name: port_code
+        description: "PH port code. Part of the composite grain."
+        tests:
+          - not_null
+      - name: port_name
+        description: "Full port name from dim_port."
+      - name: week_start_date
+        description: "Monday of the ISO week this row covers (DATE_TRUNC('week', ...)). Part of the composite grain."
+        tests:
+          - not_null
+      - name: vessel_calls
+        description: "Total vessel calls arriving at this port during the week."
+      - name: total_teu_handled
+        description: "Total TEU processed at this port during the week."
+      - name: avg_anchorage_wait_hours
+        description: "Mean anchorage wait hours for vessels arriving this week. Primary congestion input signal."
+      - name: avg_dwell_hours
+        description: "Mean total dwell hours for vessels arriving this week."
+      - name: congestion_rate_pct
+        description: "Percentage of vessel calls classified as congested (anchorage_wait_h > 24)."
+      - name: shipments_arriving
+        description: "Count of shipments with ETA in this port × week. May be null if no shipments scheduled."
+      - name: avg_shipment_delay_hours
+        description: "Mean delay hours for shipments arriving at this port this week. Primary delay output signal."
+      - name: on_time_rate_pct
+        description: "Percentage of shipments arriving on time this week at this port."
+      - name: severe_delay_count
+        description: "Count of shipments with SEVERE_DELAY (> 72 h) this week."
+      - name: congestion_level
+        description: >
+          Categorical congestion label matching dt_port_congestion thresholds:
+          CRITICAL (≥ 60%) | HIGH (≥ 35%) | MODERATE (≥ 15%) | NORMAL (< 15%).
+        tests:
+          - accepted_values:
+              values: ["CRITICAL", "HIGH", "MODERATE", "NORMAL"]
+      - name: delay_to_wait_ratio
+        description: >
+          avg_shipment_delay_hours / avg_anchorage_wait_hours.
+          Correlation proxy: consistently above 1.0 = delays exceed congestion alone;
+          consistently below 1.0 = congestion is the dominant delay driver.
+          Null when avg_anchorage_wait_hours = 0 (no congestion that week).
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run."

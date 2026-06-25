@@ -1,0 +1,5 @@
+pandas==2.3.0
+yfinance
+dbt-snowflake==1.9.4
+python-dotenv==1.0.1
+iki-data-generator==0.1.8

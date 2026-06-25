@@ -1,0 +1,392 @@
+version: 2
+
+models:
+  # ---------------------------------------------------------------------------
+  # Dimension Tables
+  # ---------------------------------------------------------------------------
+
+  - name: dim_date
+    description: >
+      Standard date dimension covering 2020-01-01 through 2030-12-31, generated
+      from a Snowflake GENERATOR spine (no external package required).
+      Reusable across all portfolio projects. Used as the date FK in all three
+      fact tables (arrival_date_key, etd/eta/ata_date_key, eta_date_key).
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: date_key
+        description: "DATE primary key in YYYY-MM-DD format. All fact date FKs join on this column."
+        tests:
+          - not_null
+          - unique
+      - name: year_num
+        description: "Calendar year (e.g. 2024)."
+      - name: quarter_num
+        description: "Quarter number 1–4."
+      - name: month_num
+        description: "Month number 1–12."
+      - name: month_name
+        description: "Abbreviated month name (Jan, Feb, …)."
+      - name: week_num
+        description: "ISO week number within the year."
+      - name: day_of_month
+        description: "Day within the month (1–31)."
+      - name: day_of_week
+        description: "Day of week (0 = Sunday, 6 = Saturday per Snowflake DAYOFWEEK)."
+      - name: day_name
+        description: "Abbreviated day name (Mon, Tue, …)."
+      - name: is_weekend
+        description: "TRUE when day_of_week is 0 (Sunday) or 6 (Saturday)."
+      - name: year_month
+        description: "YYYY-MM string for monthly rollup grouping (e.g. 2024-06)."
+      - name: year_quarter
+        description: "YYYY-QN string for quarterly rollup grouping (e.g. 2024-Q2)."
+
+  - name: dim_port
+    description: >
+      Philippine port master dimension. Sourced from seeds/ph_ports.csv which covers
+      5 international container terminals (MICT, BCT, CEBU, DAVAO, SUBIC) and 3
+      domestic ports (ILOILO, CAGAYAN, ZAMBOANGA). Augmented with H3 hex indexes at
+      resolutions 5 and 7 for geospatial clustering. Used as both origin and destination
+      port FK in fct_shipment_events, and as the port FK in fct_port_dwell and
+      dt_port_congestion Dynamic Table.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: port_key
+        description: "MD5 surrogate key derived from port_code."
+        tests:
+          - not_null
+          - unique
+      - name: port_code
+        description: "Short port identifier (MICT, BCT, CEBU, DAVAO, SUBIC, ILOILO, CAGAYAN, ZAMBOANGA)."
+        tests:
+          - not_null
+          - unique
+      - name: port_name
+        description: "Full official port name."
+      - name: region
+        description: "Philippine administrative region (NCR, CALABARZON, Central Visayas, etc.)."
+      - name: port_type
+        description: "Operational classification: international | domestic."
+      - name: lat
+        description: "Port latitude coordinate (WGS84). Used in ST_MAKEPOINT for geospatial calculations."
+      - name: lon
+        description: "Port longitude coordinate (WGS84). Used in ST_MAKEPOINT for geospatial calculations."
+      - name: h3_res5
+        description: "H3 hex index at resolution 5 (~8.5 km edge length). For coarse geospatial clustering and port congestion heatmaps."
+      - name: h3_res7
+        description: "H3 hex index at resolution 7 (~1.2 km edge length). For fine-grained vessel clustering within a port complex."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run that updated this dimension."
+
+  - name: dim_vessel
+    description: >
+      Vessel master dimension derived from distinct vessel_imo values in bronze.raw_vessel_calls.
+      200 unique vessels in the simulated pool. AIS enrichment fields (vessel_name,
+      flag_country, capacity_teu) are NULL placeholders — populated from an AIS lookup
+      API in production. primary_cargo_type is the most common cargo type seen for each
+      vessel, disambiguated by ROW_NUMBER if tied.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: vessel_key
+        description: "MD5 surrogate key derived from vessel_imo."
+        tests:
+          - not_null
+          - unique
+      - name: vessel_imo
+        description: "IMO vessel identifier — globally unique. FK source for fct_port_dwell."
+        tests:
+          - not_null
+          - unique
+      - name: vessel_name
+        description: "Official vessel name. NULL in simulated data — populated from AIS enrichment in prod."
+      - name: flag_country
+        description: "Country of vessel registration (ISO alpha-2). NULL in simulated data."
+      - name: vessel_type
+        description: "Primary cargo type handled by this vessel (FCL, LCL, RORO, BULK). Derived from most frequent cargo_type in vessel call history."
+      - name: capacity_teu
+        description: "Vessel capacity in TEU. NULL in simulated data — populated from AIS enrichment in prod."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run that updated this dimension."
+
+  - name: dim_carrier
+    description: >
+      Shipping carrier / line master dimension. Five carriers in the simulated dataset:
+      MAERSK and MSC (2M Alliance), EVERGREEN / CMA / OOCL (OCEAN Alliance).
+      Carrier names and alliance memberships are hardcoded via CASE expression;
+      extend the CASE logic when adding new carriers. Derived from distinct carrier_code
+      values in bronze.raw_shipments.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: carrier_key
+        description: "MD5 surrogate key derived from carrier_code."
+        tests:
+          - not_null
+          - unique
+      - name: carrier_code
+        description: "Carrier SCAC / common name (MAERSK, MSC, EVERGREEN, CMA, OOCL)."
+        tests:
+          - not_null
+          - unique
+      - name: carrier_name
+        description: "Full carrier name (e.g. 'Maersk Line', 'Mediterranean Shipping Company')."
+      - name: alliance
+        description: "Carrier alliance membership: 2M | OCEAN | INDEPENDENT."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run that updated this dimension."
+
+  - name: dim_shipment
+    description: >
+      Shipment attribute dimension — one row per shipment_id from stg_shipments.
+      Captures the static descriptive attributes of each shipment (ports, carrier, cargo type,
+      incoterm, declared value). Incoterm is inferred from cargo_type via a CASE expression
+      as a placeholder — replace with actual incoterm field if source data provides it.
+      Used as the descriptive FK in fct_shipment_events.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: shipment_key
+        description: "MD5 surrogate key derived from shipment_id."
+        tests:
+          - not_null
+          - unique
+      - name: shipment_id
+        description: "UUID natural key — unique per shipment."
+        tests:
+          - not_null
+          - unique
+      - name: bl_number
+        description: "Bill of Lading number."
+      - name: origin_port_code
+        description: "Uppercased LOCODE of origin port."
+      - name: dest_port_code
+        description: "Uppercased PH destination port code. Joins to dim_port."
+      - name: carrier_code
+        description: "Carrier code. Joins to dim_carrier."
+      - name: cargo_type
+        description: "Cargo category (Electronics, Machinery, Textiles, Food, Chemicals)."
+      - name: commodity_code
+        description: "HS commodity code."
+      - name: incoterm
+        description: "Inferred incoterm: CIF for Electronics/Food, CFR for Machinery, FOB for all others."
+      - name: declared_value_usd
+        description: "CIF declared value in USD at time of shipment."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run that updated this dimension."
+
+  - name: dim_customs_entry
+    description: >
+      Customs entry attribute dimension — one row per entry_number from stg_customs_entries.
+      Captures the full BOC processing timeline (lodge → assess → release) and all duty/tax
+      components. Linked to shipments via shipment_id. Used as the descriptive FK in
+      fct_landed_cost for the customs processing lens.
+    config:
+      materialized: table
+      schema: gold
+    columns:
+      - name: customs_key
+        description: "MD5 surrogate key derived from entry_number."
+        tests:
+          - not_null
+          - unique
+      - name: entry_number
+        description: "BOC customs entry number — unique natural key."
+        tests:
+          - not_null
+          - unique
+      - name: shipment_id
+        description: "FK to dim_shipment / stg_shipments. One-to-one with shipment."
+      - name: bl_number
+        description: "Bill of Lading number — denormalized for customs workflow reporting."
+      - name: commodity_code
+        description: "HS commodity code."
+      - name: entry_type
+        description: "BOC entry classification: FORMAL | INFORMAL | WAREHOUSING."
+      - name: declared_value_usd
+        description: "CIF value used as duty base."
+      - name: tariff_rate_pct
+        description: "Applied duty rate percentage."
+      - name: duties_usd
+        description: "Computed duties in USD."
+      - name: vat_usd
+        description: "12% VAT in USD (applied on CIF + duties)."
+      - name: total_tax_usd
+        description: "Total tax burden in USD (duties + VAT)."
+      - name: lodge_date
+        description: "Date entry lodged with BOC."
+      - name: assessment_date
+        description: "Date BOC completed assessment."
+      - name: release_date
+        description: "Date cargo released from customs."
+      - name: processing_days
+        description: "Clearance cycle time in days (lodge to release)."
+      - name: payment_mode
+        description: "Duty payment method: CASH | SURETY_BOND | DEFERRED."
+      - name: port_code
+        description: "Port where clearance occurred."
+      - name: dbt_updated_at
+        description: "Timestamp of last dbt run that updated this dimension."
+
+  # ---------------------------------------------------------------------------
+  # Fact Tables
+  # ---------------------------------------------------------------------------
+
+  - name: fct_port_dwell
+    description: >
+      Grain: one row per vessel port call (vessel_imo + berth_ts).
+      Core congestion fact table tracking dwell time and anchorage wait per vessel call.
+      Joins stg_vessel_calls to dim_vessel, dim_date (on arrival date), and dim_port.
+      H3 enrichment (port_h3_res5) is applied here — not in staging — because H3 index
+      is a property of dim_port. is_congested flags calls with anchorage_wait_h > 24.
+      Incremental on _loaded_at watermark; unique_key is vessel_imo || berth_ts.
+      Primary source for the dt_port_congestion Dynamic Table and dwell time KPIs.
+    config:
+      materialized: incremental
+      schema: gold
+    columns:
+      - name: vessel_imo
+        description: "IMO vessel identifier — natural join key to dim_vessel."
+      - name: vessel_key
+        description: "FK to dim_vessel.vessel_key."
+      - name: arrival_date_key
+        description: "FK to dim_date.date_key (cast of arrival_ts to DATE)."
+      - name: port_key
+        description: "FK to dim_port.port_key."
+      - name: berth_ts
+        description: "Berth assignment timestamp — part of the compound unique_key with vessel_imo."
+      - name: cargo_type
+        description: "Cargo type for this port call: FCL | LCL | RORO | BULK."
+      - name: dwell_hours
+        description: "Total port dwell in hours (arrival to departure)."
+        tests:
+          - not_null
+          - expression_is_true:
+              arguments:
+                expression: ">= 0"
+      - name: anchorage_wait_h
+        description: "Hours waiting at anchorage before berth. Congestion proxy measure."
+        tests:
+          - not_null
+      - name: teu_count
+        description: "TEU volume handled in this port call."
+      - name: port_h3_res5
+        description: "H3 resolution 5 hex index from dim_port. Enables hex-binned congestion heatmaps."
+      - name: is_congested
+        description: "TRUE when anchorage_wait_h > 24 hours. Used in congestion_pct calculation for dt_port_congestion."
+      - name: _loaded_at
+        description: "Bronze load timestamp. Incremental watermark."
+
+  - name: fct_shipment_events
+    description: >
+      Grain: one row per shipment (shipment_id).
+      Central delay analytics fact table. Joins stg_shipments to dim_shipment, dim_carrier,
+      three dim_date references (ETD, ETA, ATA date keys), and two dim_port references
+      (origin and destination). event_type is derived from delay_category for BI filtering.
+      Incremental on _loaded_at; unique_key is shipment_id.
+      Primary source for delay trend dashboards and the dt_active_shipments Dynamic Table.
+    config:
+      materialized: incremental
+      schema: gold
+    columns:
+      - name: shipment_id
+        description: "Natural key — unique per shipment."
+        tests:
+          - not_null
+          - unique
+      - name: shipment_key
+        description: "FK to dim_shipment.shipment_key."
+      - name: etd_date_key
+        description: "FK to dim_date.date_key for ETD."
+      - name: eta_date_key
+        description: "FK to dim_date.date_key for ETA."
+      - name: ata_date_key
+        description: "FK to dim_date.date_key for ATA. Null for in-transit shipments."
+      - name: origin_port_key
+        description: "FK to dim_port.port_key for origin port."
+      - name: dest_port_key
+        description: "FK to dim_port.port_key for destination port."
+      - name: carrier_key
+        description: "FK to dim_carrier.carrier_key."
+      - name: etd
+        description: "Estimated Time of Departure timestamp."
+      - name: eta
+        description: "Estimated Time of Arrival timestamp."
+      - name: ata
+        description: "Actual Time of Arrival timestamp. NULL = in-transit."
+      - name: delay_hours
+        description: "Recomputed delay hours from stg_shipments. Clamped to 0 for early arrivals."
+        tests:
+          - not_null
+      - name: delay_category
+        description: "Ordinal delay band: ON_TIME | MINOR_DELAY | MODERATE_DELAY | SEVERE_DELAY."
+      - name: event_type
+        description: >
+          Derived event type for dashboard filtering:
+          IN_TRANSIT | ARRIVED_ON_TIME | ARRIVED_MINOR_DELAY |
+          ARRIVED_MODERATE_DELAY | ARRIVED_SEVERE_DELAY.
+      - name: declared_value_usd
+        description: "CIF declared value — denormalized for revenue-weighted delay analysis."
+      - name: freight_usd
+        description: "Freight cost in USD."
+      - name: insurance_usd
+        description: "Insurance cost in USD."
+      - name: _loaded_at
+        description: "Bronze load timestamp. Incremental watermark."
+
+  - name: fct_landed_cost
+    description: >
+      Grain: one row per shipment (shipment_id).
+      Landed cost computation combining CIF value, CMTA/ASEAN ATIGA duty rates (ph_tariff_rates
+      seed), and historical USD/PHP FX rates (usd_php_rates seed). FX is forward-filled
+      using MAX(rate_date) <= ETA date to find the closest available rate.
+      total_landed_cost_php = CIF × (1 + duty_rate) × 1.12 (VAT) × usd_php_rate.
+      Incremental on _loaded_at; unique_key is shipment_id.
+      Primary source for landed cost by commodity dashboard.
+    config:
+      materialized: incremental
+      schema: gold
+    columns:
+      - name: shipment_id
+        description: "Natural key — unique per shipment."
+        tests:
+          - not_null
+          - unique
+      - name: bl_number
+        description: "Bill of Lading number."
+      - name: dest_port_code
+        description: "Destination port code."
+      - name: eta_date_key
+        description: "ETA cast to DATE — used as the FX rate lookup anchor."
+      - name: declared_value_usd
+        description: "Item CIF value in USD (excluding freight and insurance)."
+      - name: freight_usd
+        description: "Freight cost in USD."
+      - name: insurance_usd
+        description: "Insurance cost in USD."
+      - name: cif_usd
+        description: "Total CIF in USD: declared_value_usd + freight_usd + insurance_usd. Duty base."
+      - name: duty_rate_pct
+        description: "Duty rate from ph_tariff_rates seed. Defaults to 0 when commodity code has no match."
+      - name: duties_usd
+        description: "Computed duties: cif_usd × duty_rate_pct / 100."
+      - name: vat_usd
+        description: "12% VAT: (cif_usd + duties_usd) × 0.12 per Philippine customs law."
+      - name: total_landed_cost_php
+        description: >
+          Total landed cost in Philippine Peso:
+          (cif_usd × (1 + duty_rate_pct/100) × 1.12) × usd_php_rate.
+          Primary KPI for the 'Landed cost by commodity' dashboard chart.
+        tests:
+          - not_null
+      - name: usd_php_rate
+        description: "USD/PHP exchange rate from usd_php_rates seed, forward-filled to the closest date on or before ETA."
+      - name: _loaded_at
+        description: "Bronze load timestamp. Incremental watermark."

@@ -1,0 +1,40 @@
+name: "logistics_dbt"
+version: "1.0.0"
+config-version: 2
+
+profile: "logistics"
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  logistics_dbt:
+    staging:
+      +materialized: view
+      +schema: silver
+    marts:
+      core:
+        +materialized: table
+        +schema: gold
+      analytics:
+        +materialized: table
+        +schema: gold
+
+seeds:
+  logistics_dbt:
+    ph_tariff_rates:
+      +column_types:
+        mfn_rate_pct: float
+        atiga_rate_pct: float
+        vat_pct: float
+    usd_php_rates:
+      +column_types:
+        usd_php_close: float
+        usd_php_open: float
+        usd_php_high: float
+        usd_php_low: float
