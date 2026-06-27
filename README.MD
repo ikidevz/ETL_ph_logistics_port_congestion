@@ -1,5 +1,7 @@
 # ph-logistics-port-congestion
 
+![cover_img](https://tdhghaslnufgtzjybhhf.supabase.co/storage/v1/object/public/content/ETL%20Engineer%20Portfoilo/ph_multi_subsdridary.png)
+
 End-to-end ELT pipeline tracking shipment delays, port congestion, and landed cost across five major Philippine international ports (MICT, Batangas, Cebu, Davao, Subic). Implements a Kimball star schema on Snowflake with Dynamic Tables for near-real-time congestion scoring — no Kafka, no streaming infrastructure.
 
 ---
